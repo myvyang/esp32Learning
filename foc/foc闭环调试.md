@@ -1,0 +1,299 @@
+
+检查完[电机接线正常](https://github.com/myvyang/esp32Learning/blob/main/foc/foc%E7%94%B5%E6%9C%BA%E8%B0%83%E8%AF%95%E8%AE%B0%E5%BD%9520250810.md)后，开始检查AS5600正常。
+
+检查是否连线正常：
+
+```c
+#include <Wire.h>
+TwoWire I2Ctest = TwoWire(1);
+
+void setup() {
+  Serial.begin(115200);
+  I2Ctest.begin(19, 18, 100000);  // SDA=19, SCL=18
+  Serial.println("I2C scanning...");
+}
+
+void loop() {
+  byte error, address;
+  int nDevices = 0;
+
+  for (address = 1; address < 127; address++) {
+    I2Ctest.beginTransmission(address);
+    error = I2Ctest.endTransmission();
+
+    if (error == 0) {
+      Serial.print("Found device at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      nDevices++;
+    }
+  }
+
+  if (nDevices == 0) {
+    Serial.println("❌ No I2C device found!");
+  }
+  Serial.println();
+
+  delay(2000);
+}
+```
+
+检查读数：
+
+```c
+#include <SimpleFOC.h>
+#include <Wire.h>
+
+// 创建 AS5600 编码器对象（I2C 地址默认 0x36）
+MagneticSensorI2C encoder = MagneticSensorI2C(0x36, 12, 0x0E, 4);
+
+// 用于通信的 I2C 实例（SimpleFOC 使用）
+TwoWire I2Cone = TwoWire(0);  // ESP32: Wire = 0, Wire1 = 1
+
+void setup() {
+  // 初始化串口用于调试
+  Serial.begin(115200);
+
+  // 初始化 I2C（SCL: 22, SDA: 21）
+  I2Cone.begin(19, 18);
+
+  // 初始化编码器
+  encoder.init(&I2Cone);
+
+  Serial.println("AS5600 编码器已启动！");
+}
+
+void loop() {
+  // 获取当前角度（单位：弧度）
+  float angle = encoder.getAngle();
+
+  // 获取原始角度（0~4095，12位）
+  float raw_angle = encoder.getSensorAngle();
+
+  // 打印数据（建议降频打印，避免影响实时性）
+  Serial.print("角度(弧度): ");
+  Serial.print(angle, 3);
+  Serial.print("  | 原始值: ");
+  Serial.println(raw_angle);
+
+  delay(100);  // 降低打印频率，避免干扰
+}
+```
+
+一切正常开始闭环控制：
+
+```c
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SimpleFOC.h>
+
+// === 自定义 I2C 总线（使用 GPIO19=SDA, GPIO18=SCL）===
+TwoWire I2Cencoder = TwoWire(1);
+
+// === AS5600 编码器对象 ===
+MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+
+// === 电机驱动（U=25, V=26, W=27, EN=33 可选）===
+BLDCDriver3PWM driver = BLDCDriver3PWM(25, 26, 27, 33);
+
+// === 电机对象（2204 通常是 7 对极）===
+BLDCMotor motor = BLDCMotor(7);
+
+void setup() {
+  // 串口监视
+  Serial.begin(115200);
+
+  I2Cencoder.begin(19, 18, 400000);  // 100kHz
+  sensor.init(&I2Cencoder);
+
+  driver.voltage_power_supply = 12;        // 实际电源电压（V）
+  driver.init();
+
+  // 连接传感器到电机
+  motor.linkSensor(&sensor);
+  motor.linkDriver(&driver);
+
+  motor.voltage_sensor_align = 4.0f;       // 校准时电压（3V）
+  motor.voltage_limit = 10;              // 运行电压限制（可调高）
+  motor.controller = MotionControlType::angle;
+
+  motor.useMonitoring(Serial);
+
+  // 在 motor.init(); 之后添加：
+  motor.PID_velocity.P = 0.1;   // 原默认 0.5，太大
+  motor.PID_velocity.I = 10.0;  // 可保留
+  motor.PID_velocity.D = 0.0;   // 一般为 0
+
+  // 位置环（angle）控制器
+  motor.P_angle.P = 15.0;       // 原默认 20，可先设小点
+  motor.P_angle.I = 0;          // 位置环通常不用 I
+  motor.P_angle.D = 0.5;        // 加一点阻尼，抑制抖动
+
+  // 可选：加低通滤波，平滑速度
+  motor.LPF_velocity = 0.01f;   // 10ms 滤波
+
+  motor.init();
+  motor.initFOC();
+
+  Serial.println("✅ Motor ready! Starting movement...");
+}
+
+unsigned long last_time = 0;
+void loop() {
+  unsigned long now = millis();
+
+  // 每 2ms 执行一次 FOC 控制（500Hz）
+  if (now - last_time >= 2) {
+    motor.loopFOC();
+    motor.move(90 * DEG_TO_RAD);  // 目标 90 度（弧度）
+    last_time = now;
+  }
+
+  // 可选：每 100ms 打印一次角度（避免干扰控制）
+  static unsigned long print_time = 0;
+  if (now - print_time >= 100) {
+    Serial.print("Angle: ");
+    Serial.print(motor.shaftAngle() * RAD_TO_DEG);
+    Serial.println("°");
+    print_time = now;
+  }
+}
+```
+这里的细节完全靠AI补充的。主要是PID参数调整：
+
+```c
+  // 在 motor.init(); 之后添加：
+  motor.PID_velocity.P = 0.1;   // 原默认 0.5，太大
+  motor.PID_velocity.I = 10.0;  // 可保留
+  motor.PID_velocity.D = 0.0;   // 一般为 0
+
+  // 位置环（angle）控制器
+  motor.P_angle.P = 15.0;       // 原默认 20，可先设小点
+  motor.P_angle.I = 0;          // 位置环通常不用 I
+  motor.P_angle.D = 0.5;        // 加一点阻尼，抑制抖动
+```
+AI说 simpleFOC 的默认PID参数太激进，改小了。
+
+修改好了之后，确实可以闭环了。摸电机还有微小的抖动，但是方向基本不动了。
+
+试了下自己修改：
+```c
+  motor.PID_velocity.P = 0.2;   // 剧烈抖动
+
+  motor.PID_velocity.P = 0.02;   // 会像弹簧一样，来回抖动很久。但是稳定下来后，几乎没有偏差。
+
+  motor.P_angle.D = 0.8;     // 位置阻尼增大，会回正更慢
+```
+AI说编码器读数抖动经常会是导致微小抖动的原因。这个通过单独输出AS5600的数字可以确认没有这个问题。
+
+对于微小的抖动，上面的参数修改基本没用。下面这个滤波生效了：
+
+```c
+  motor.LPF_angle = 0.01f;    // 10ms 滤波
+```
+
+最终的闭环稳定代码：
+
+```c
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SimpleFOC.h>
+
+// === 自定义 I2C 总线（使用 GPIO19=SDA, GPIO18=SCL）===
+TwoWire I2Cencoder = TwoWire(1);
+
+// === AS5600 编码器对象 ===
+MagneticSensorI2C sensor = MagneticSensorI2C(AS5600_I2C);
+
+// === 电机驱动（U=25, V=26, W=27, EN=33 可选）===
+BLDCDriver3PWM driver = BLDCDriver3PWM(25, 26, 27, 33);
+
+// === 电机对象（2204 通常是 7 对极）===
+BLDCMotor motor = BLDCMotor(7);
+
+void setup() {
+  // 串口监视
+  Serial.begin(115200);
+
+  I2Cencoder.begin(19, 18, 400000);  // 100kHz
+  sensor.init(&I2Cencoder);
+
+  driver.voltage_power_supply = 12;        // 实际电源电压（V）
+  driver.init();
+
+  // 连接传感器到电机
+  motor.linkSensor(&sensor);
+  motor.linkDriver(&driver);
+
+  motor.voltage_sensor_align = 4.0f;       // 校准时电压（3V）
+  motor.voltage_limit = 10;              // 运行电压限制（可调高）
+  motor.controller = MotionControlType::angle;
+
+  // motor.useMonitoring(Serial);
+
+  // 在 motor.init(); 之后添加：
+  motor.PID_velocity.P = 0.1;   // 原默认 0.5，太大
+  motor.PID_velocity.I = 10.0;  // 可保留
+  motor.PID_velocity.D = 0.0;   // 一般为 0
+
+  // 位置环（angle）控制器
+  motor.P_angle.P = 5.0;       // 原默认 20，可先设小点
+  motor.P_angle.I = 0;          // 位置环通常不用 I
+  motor.P_angle.D = 0.5;        // 加一点阻尼，抑制抖动
+
+  // 可选：加低通滤波，平滑速度
+  motor.LPF_velocity = 0.01f;   // 10ms 滤波
+  motor.LPF_angle = 0.01f;    // 10ms 滤波
+
+  motor.init();
+  motor.initFOC();
+
+  Serial.println("✅ Motor ready! Starting movement...");
+}
+
+unsigned long last_time = 0;
+void loop() {
+  unsigned long now = millis();
+
+  // 每 2ms 执行一次 FOC 控制（500Hz）
+  if (now - last_time >= 2) {
+    motor.loopFOC();
+    motor.move(90 * DEG_TO_RAD);  // 目标 90 度（弧度）
+    last_time = now;
+  }
+
+  // 可选：每 100ms 打印一次角度（避免干扰控制）
+  static unsigned long print_time = 0;
+  if (now - print_time >= 1000) {
+    Serial.print("Angle: ");
+    Serial.print(motor.shaftAngle() * RAD_TO_DEG);
+    Serial.println("°");
+    print_time = now;
+  }
+}
+```
+
+平滑稳定转动测试：
+
+```
+float target = 0;
+void loop() {
+  unsigned long now = millis();
+  if (now - last_time >= 2) {
+    target = 90 + 45 * sin(now / 1000.0);
+    motor.move(target * DEG_TO_RAD);
+    motor.loopFOC();
+    last_time = now;
+  }
+}
+```
+
+
+
+
+
+
+
+
